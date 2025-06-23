@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
 
-declare_id!("EAaM3VgK9KvFQYxrwsHf7gjH21fbzrqgyL5HHy6V8eaM");
+declare_id!("5C73TX7gSriX7MXzMAWNiKDU5ZRBcEx6yAQ2KaGKzeLW");
 
 // Program constants
 const MAX_AD_ID_LENGTH: usize = 32;
