@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
 
-declare_id!("5C73TX7gSriX7MXzMAWNiKDU5ZRBcEx6yAQ2KaGKzeLW");
+declare_id!("HRtVXSRabAJ8Mk2NfEFPhquhcgphYZJWnLBwbKxto2Xq");
 
 // Program constants
 const MAX_AD_ID_LENGTH: usize = 32;
@@ -30,6 +30,7 @@ pub mod fee_payment_dapp {
         state.base_transaction_fee = BASE_TRANSACTION_FEE;
         state.is_paused = false;
         state.bump = ctx.bumps.state;
+        state.treasury_bump = ctx.bumps.treasury;
 
         emit!(ProgramInitialized {
             admin: state.admin,
@@ -44,19 +45,18 @@ pub mod fee_payment_dapp {
         require!(!ctx.accounts.state.is_paused, FeePaymentError::ProgramPaused);
         require!(amount > 0 && amount <= MAX_SINGLE_DEPOSIT, FeePaymentError::InvalidAmount);
 
-        // Do the transfer first before borrowing state mutably
+        // Transfer to treasury PDA instead of state
         transfer(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
                 Transfer {
                     from: ctx.accounts.admin.to_account_info(),
-                    to: ctx.accounts.state.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
                 },
             ),
             amount,
         )?;
 
-        // Now borrow state mutably to update it
         let state = &mut ctx.accounts.state;
         state.total_funds = state.total_funds
             .checked_add(amount)
@@ -119,6 +119,7 @@ pub mod fee_payment_dapp {
 
         Ok(())
     }
+    
     /// Toggle advertisement status
     pub fn toggle_ad(ctx: Context<ToggleAd>) -> Result<()> {
         let ad = &mut ctx.accounts.ad;
@@ -185,7 +186,6 @@ pub mod fee_payment_dapp {
     }
 
     /// STEP 2: Complete transaction - Program sponsors gas fee separately
-    /// User amount goes directly to recipient, program pays gas fee separately
     pub fn complete_transaction_after_ad(
         ctx: Context<CompleteTransaction>,
         view_duration: i64,
@@ -219,7 +219,7 @@ pub mod fee_payment_dapp {
         // Get values before mutable borrowing
         let user_amount = request.amount;
         let gas_fee = request.calculated_fee;
-        let state_bump = ctx.accounts.state.bump;
+        let treasury_bump = ctx.accounts.state.treasury_bump;
         
         // Validate sufficient program funds for gas fee sponsorship
         require!(
@@ -231,7 +231,7 @@ pub mod fee_payment_dapp {
         msg!("User sends: {} lamports", user_amount);
         msg!("Recipient receives: {} lamports (exact same amount)", user_amount);
         msg!("Program sponsors gas fee: {} lamports", gas_fee);
-        // CORRECTED TRANSACTION FLOW:
+        
         // Transfer 1: User → Recipient (exact amount, no gas fee added)
         transfer(
             CpiContext::new(
@@ -241,26 +241,25 @@ pub mod fee_payment_dapp {
                     to: ctx.accounts.recipient.to_account_info(),
                 },
             ),
-            user_amount, // Recipient gets exactly what user sent
+            user_amount,
         )?;
 
-        // Transfer 2: Program → Fee account (gas fee sponsorship)
-        // This is where the program pays the gas fee as a separate cost
-        let signer_seeds = &[b"state".as_ref(), &[state_bump]];
+        // Transfer 2: Treasury → Fee account (gas fee sponsorship)
+        let treasury_signer_seeds = &[b"treasury".as_ref(), &[treasury_bump]];
         
         transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.state.to_account_info(),
+                    from: ctx.accounts.treasury.to_account_info(),
                     to: ctx.accounts.fee_account.to_account_info(),
                 },
-                &[signer_seeds],
+                &[treasury_signer_seeds],
             ),
-            gas_fee, // Program pays gas fee separately
+            gas_fee,
         )?;
 
-        // Now update program state - only deduct the gas fee we sponsored
+        // Update program state
         let state = &mut ctx.accounts.state;
         state.total_funds = state.total_funds
             .checked_sub(gas_fee)
@@ -288,7 +287,7 @@ pub mod fee_payment_dapp {
             user: request.user,
             recipient: request.recipient,
             amount_sent: user_amount,
-            amount_received: user_amount, // Same as sent!
+            amount_received: user_amount,
             gas_fee_sponsored: gas_fee,
             ad_id: ad.id.clone(),
             view_duration,
@@ -296,9 +295,6 @@ pub mod fee_payment_dapp {
         });
 
         msg!("✅ Transaction completed with gas fee sponsorship!");
-        msg!("User sent: {} lamports", user_amount);
-        msg!("Recipient received: {} lamports", user_amount);
-        msg!("Program sponsored: {} lamports", gas_fee);
 
         Ok(())
     }
@@ -370,26 +366,24 @@ pub mod fee_payment_dapp {
     pub fn withdraw_funds(ctx: Context<WithdrawFunds>, amount: u64) -> Result<()> {
         require!(amount > 0, FeePaymentError::InvalidAmount);
         
-        // Get values before mutable borrowing
-        let state_bump = ctx.accounts.state.bump;
+        let treasury_bump = ctx.accounts.state.treasury_bump;
         
         require!(ctx.accounts.state.total_funds >= amount, FeePaymentError::InsufficientProgramFunds);
 
-        let signer_seeds = &[b"state".as_ref(), &[state_bump]];
+        let treasury_signer_seeds = &[b"treasury".as_ref(), &[treasury_bump]];
         
         transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.state.to_account_info(),
+                    from: ctx.accounts.treasury.to_account_info(),
                     to: ctx.accounts.admin.to_account_info(),
                 },
-                &[signer_seeds],
+                &[treasury_signer_seeds],
             ),
             amount,
         )?;
 
-        // Now update state
         let state = &mut ctx.accounts.state;
         state.total_funds = state.total_funds
             .checked_sub(amount)
@@ -405,9 +399,8 @@ pub mod fee_payment_dapp {
     }
 }
 
-/// Calculate gas fee for transaction - moved outside the impl block
+/// Calculate gas fee for transaction
 fn calculate_gas_fee(amount: u64, state: &ProgramState) -> u64 {
-    // Simple calculation: base fee + percentage of amount
     let percentage_fee = amount / 1000; // 0.1% of amount
     state.base_transaction_fee + percentage_fee
 }
@@ -423,7 +416,8 @@ pub struct ProgramState {
     pub base_transaction_fee: u64,      // 8
     pub is_paused: bool,               // 1
     pub bump: u8,                      // 1
-}                                      // Total: 74 bytes
+    pub treasury_bump: u8,             // 1 - Added treasury bump
+}                                      // Total: 75 bytes
 
 #[account]
 pub struct Advertisement {
@@ -462,7 +456,7 @@ pub enum RequestStatus {
     Cancelled,
 }
 
-// Events
+// Events (keeping same as original)
 #[event]
 pub struct ProgramInitialized {
     pub admin: Pubkey,
@@ -475,6 +469,7 @@ pub struct FundsDeposited {
     pub amount: u64,
     pub total_funds: u64,
 }
+
 #[event]
 pub struct AdCreated {
     pub ad_id: String,
@@ -507,9 +502,9 @@ pub struct TransactionInitiated {
 pub struct TransactionCompleted {
     pub user: Pubkey,
     pub recipient: Pubkey,
-    pub amount_sent: u64,           // What user sent
-    pub amount_received: u64,       // What recipient received (same as sent)
-    pub gas_fee_sponsored: u64,     // What program paid as sponsorship
+    pub amount_sent: u64,
+    pub amount_received: u64,
+    pub gas_fee_sponsored: u64,
     pub ad_id: String,
     pub view_duration: i64,
     pub timestamp: i64,
@@ -555,11 +550,17 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = deployer,
-        space = 8 + 74,
+        space = 8 + 75, // Updated space for new field
         seeds = [b"state"],
         bump
     )]
     pub state: Account<'info, ProgramState>,
+    /// CHECK: Treasury PDA for holding funds
+    #[account(
+        seeds = [b"treasury"],
+        bump
+    )]
+    pub treasury: AccountInfo<'info>,
     #[account(mut)]
     pub deployer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -574,6 +575,13 @@ pub struct DepositFunds<'info> {
         has_one = admin @ FeePaymentError::Unauthorized
     )]
     pub state: Account<'info, ProgramState>,
+    /// CHECK: Treasury PDA for holding funds
+    #[account(
+        mut,
+        seeds = [b"treasury"],
+        bump = state.treasury_bump
+    )]
+    pub treasury: AccountInfo<'info>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -625,7 +633,7 @@ pub struct InitiateSend<'info> {
         init,
         payer = user,
         space = 8 + 162,
-        seeds = [b"request", user.key().as_ref(), &Clock::get().unwrap().unix_timestamp.to_le_bytes()],
+        seeds = [b"request", user.key().as_ref()],
         bump
     )]
     pub request: Account<'info, TransactionRequest>,
@@ -635,6 +643,7 @@ pub struct InitiateSend<'info> {
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
+
 #[derive(Accounts)]
 pub struct CompleteTransaction<'info> {
     #[account(
@@ -643,6 +652,13 @@ pub struct CompleteTransaction<'info> {
         bump = state.bump
     )]
     pub state: Account<'info, ProgramState>,
+    /// CHECK: Treasury PDA for holding funds
+    #[account(
+        mut,
+        seeds = [b"treasury"],
+        bump = state.treasury_bump
+    )]
+    pub treasury: AccountInfo<'info>,
     #[account(
         mut,
         constraint = ad.id == request.selected_ad_id @ FeePaymentError::AdMismatch
@@ -651,7 +667,8 @@ pub struct CompleteTransaction<'info> {
     #[account(
         mut,
         has_one = user @ FeePaymentError::Unauthorized,
-        constraint = request.recipient == recipient.key() @ FeePaymentError::RecipientMismatch
+        constraint = request.recipient == recipient.key() @ FeePaymentError::RecipientMismatch,
+        close = user
     )]
     pub request: Account<'info, TransactionRequest>,
     #[account(mut)]
@@ -659,7 +676,7 @@ pub struct CompleteTransaction<'info> {
     /// CHECK: Recipient validation through constraint
     #[account(mut)]
     pub recipient: AccountInfo<'info>,
-    /// CHECK: Fee account to receive sponsored gas fees (treasury/burn account)
+    /// CHECK: Fee account to receive sponsored gas fees
     #[account(mut)]
     pub fee_account: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
@@ -675,7 +692,8 @@ pub struct GetRandomAd<'info> {
 pub struct CancelRequest<'info> {
     #[account(
         mut,
-        has_one = user @ FeePaymentError::Unauthorized
+        has_one = user @ FeePaymentError::Unauthorized,
+        close = user
     )]
     pub request: Account<'info, TransactionRequest>,
     pub user: Signer<'info>,
@@ -702,6 +720,13 @@ pub struct WithdrawFunds<'info> {
         has_one = admin @ FeePaymentError::Unauthorized
     )]
     pub state: Account<'info, ProgramState>,
+    /// CHECK: Treasury PDA for holding funds
+    #[account(
+        mut,
+        seeds = [b"treasury"],
+        bump = state.treasury_bump
+    )]
+    pub treasury: AccountInfo<'info>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
